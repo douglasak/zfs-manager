@@ -164,23 +164,35 @@ function ds_mountpoint(string $ds): string {
     return ($mp !== '' && $mp[0] === '/') ? $mp : '';   // skip legacy/none/-
 }
 
-/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
-function browse_snapshot(string $snap, string $rel): array {
-    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+/**
+ * Resolve a snapshot-relative path to an absolute real path jailed under the
+ * snapshot root. Returns [true, $realpath, $rootReal] or [false, $errorMessage].
+ * Shared by browse (directory listing) and download (file streaming).
+ */
+function snapshot_resolve(string $snap, string $rel): array {
+    if (!snap_valid($snap)) return [false, "Unknown snapshot: '$snap'."];
     [$ds, $name] = explode('@', $snap, 2);
 
     $mp = ds_mountpoint($ds);
-    if ($mp === '') return fail("Dataset '$ds' has no browsable mountpoint.");
+    if ($mp === '') return [false, "Dataset '$ds' has no browsable mountpoint."];
 
     $rootReal = realpath($mp . '/.zfs/snapshot/' . $name);   // automounts on access
-    if ($rootReal === false) return fail('Snapshot tree not accessible.');
+    if ($rootReal === false) return [false, 'Snapshot tree not accessible.'];
 
     $real = realpath($rootReal . '/' . ltrim($rel, '/'));
     // jail: must resolve to the root itself or something beneath "root/".
     if ($real === false ||
         ($real !== $rootReal && strncmp($real, $rootReal . '/', strlen($rootReal) + 1) !== 0)) {
-        return fail('Path not found.');
+        return [false, 'Path not found.'];
     }
+    return [true, $real, $rootReal];
+}
+
+/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
+function browse_snapshot(string $snap, string $rel): array {
+    $r = snapshot_resolve($snap, $rel);
+    if (!$r[0]) return fail($r[1]);
+    [, $real, $rootReal] = $r;
     if (!is_dir($real)) return fail('Not a directory.');
 
     $dirs = []; $files = [];

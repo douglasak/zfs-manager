@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "zfs.manager">
 <!ENTITY author    "douglasak">
-<!ENTITY version   "2026.06.21a">
+<!ENTITY version   "2026.06.22a">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/zfs-manager/main/zfs.manager.plg">
 <!ENTITY support   "https://github.com/douglasak/zfs-manager/issues">
 <!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
@@ -19,11 +19,15 @@
 
 <CHANGES>
 ###&version;
-- Add read-only snapshot browser: navigate a snapshot's point-in-time file
-  tree (sizes, dates, breadcrumb) via its .zfs/snapshot/ path. Every request is
-  jailed to the snapshot root, so ../ and absolute paths cannot escape.
+- Snapshot browser: files are now clickable to download. New path-jailed
+  download endpoint streams a single file from the snapshot's .zfs/snapshot/
+  tree (directories and out-of-jail paths refused).
 
-###previous
+###2026.06.21a
+- Add read-only snapshot browser: navigate a snapshot's point-in-time file
+  tree (sizes, dates, breadcrumb). Every request jailed to the snapshot root.
+
+###earlier
 - Web GUI under Settings -> Utilities -> ZFS Manager: dataset overview table,
   create snapshots (optionally recursive), roll back, and destroy.
 - All zfs calls run on the host with escaped args; every dataset/snapshot is
@@ -125,7 +129,7 @@ $host = emhttp_var('NAME', 'this server');
     </div>
     <div class="zsm-crumbs" id="zsm-br-crumbs"></div>
     <table class="zsm" id="zsm-br-table">
-      <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+      <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
       <tbody id="zsm-br-body"></tbody>
     </table>
     <p style="opacity:.7;margin:4px 0 0">Read-only point-in-time view from this snapshot.</p>
@@ -135,6 +139,7 @@ $host = emhttp_var('NAME', 'this server');
 <script>
 (function () {
   var API  = '/plugins/zfs.manager/include/api.php';
+  var DL   = '/plugins/zfs.manager/include/download.php';
   var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
 
   function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
@@ -260,35 +265,43 @@ $host = emhttp_var('NAME', 'this server');
 
   function brLoad(path){
     var body = document.getElementById('zsm-br-body');
-    body.innerHTML = '<tr><td colspan="3">Loading…</td></tr>';
+    body.innerHTML = '<tr><td colspan="4">Loading…</td></tr>';
     $.getJSON(API + '?action=browse&snapshot=' + encodeURIComponent(brSnap) + '&path=' + encodeURIComponent(path || ''))
       .done(function(d){
-        if (!d.ok){ body.innerHTML = '<tr><td colspan="3">' + esc(d.message || 'Error') + '</td></tr>'; return; }
+        if (!d.ok){ body.innerHTML = '<tr><td colspan="4">' + esc(d.message || 'Error') + '</td></tr>'; return; }
         document.getElementById('zsm-br-crumbs').innerHTML = crumbs(d.path);
 
         var rows = '';
         if (d.path){
           var parent = d.path.split('/').slice(0, -1).join('/');
           rows += '<tr><td class="tname"><i class="fa fa-level-up"></i> '+
-                  '<a class="dir" data-path="' + esc(parent) + '">..</a></td><td></td><td></td></tr>';
+                  '<a class="dir" data-path="' + esc(parent) + '">..</a></td><td></td><td></td><td></td></tr>';
         }
         if (!d.entries.length && !d.path){
-          rows += '<tr><td colspan="3">(empty)</td></tr>';
+          rows += '<tr><td colspan="4">(empty)</td></tr>';
         }
         d.entries.forEach(function(e){
           var icon = e.type === 'dir' ? 'fa-folder' : (e.type === 'link' ? 'fa-link' : 'fa-file-o');
-          var name = e.type === 'dir'
-            ? '<a class="dir" data-path="' + esc((d.path ? d.path + '/' : '') + e.name) + '">' + esc(e.name) + '</a>'
-            : esc(e.name);
+          var rel  = (d.path ? d.path + '/' : '') + e.name;
+          var name, dl = '';
+          if (e.type === 'dir'){
+            name = '<a class="dir" data-path="' + esc(rel) + '">' + esc(e.name) + '</a>';
+          } else {
+            var href = DL + '?snapshot=' + encodeURIComponent(brSnap) + '&path=' + encodeURIComponent(rel);
+            name = '<a href="' + esc(href) + '" download title="Download">' + esc(e.name) + '</a>';
+            dl   = '<a href="' + esc(href) + '" download title="Download ' + esc(e.name) + '">'+
+                   '<i class="fa fa-download"></i></a>';
+          }
           rows += '<tr>'+
             '<td class="tname"><i class="fa ' + icon + '"></i> ' + name + '</td>'+
             '<td class="num">' + esc(fmtSize(e.size)) + '</td>'+
             '<td>' + esc(fmtTime(e.mtime)) + '</td>'+
+            '<td>' + dl + '</td>'+
           '</tr>';
         });
         body.innerHTML = rows;
       })
-      .fail(function(){ body.innerHTML = '<tr><td colspan="3">Could not reach the ZFS API.</td></tr>'; });
+      .fail(function(){ body.innerHTML = '<tr><td colspan="4">Could not reach the ZFS API.</td></tr>'; });
   }
 
   $(function(){
@@ -489,23 +502,35 @@ function ds_mountpoint(string $ds): string {
     return ($mp !== '' && $mp[0] === '/') ? $mp : '';   // skip legacy/none/-
 }
 
-/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
-function browse_snapshot(string $snap, string $rel): array {
-    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+/**
+ * Resolve a snapshot-relative path to an absolute real path jailed under the
+ * snapshot root. Returns [true, $realpath, $rootReal] or [false, $errorMessage].
+ * Shared by browse (directory listing) and download (file streaming).
+ */
+function snapshot_resolve(string $snap, string $rel): array {
+    if (!snap_valid($snap)) return [false, "Unknown snapshot: '$snap'."];
     [$ds, $name] = explode('@', $snap, 2);
 
     $mp = ds_mountpoint($ds);
-    if ($mp === '') return fail("Dataset '$ds' has no browsable mountpoint.");
+    if ($mp === '') return [false, "Dataset '$ds' has no browsable mountpoint."];
 
     $rootReal = realpath($mp . '/.zfs/snapshot/' . $name);   // automounts on access
-    if ($rootReal === false) return fail('Snapshot tree not accessible.');
+    if ($rootReal === false) return [false, 'Snapshot tree not accessible.'];
 
     $real = realpath($rootReal . '/' . ltrim($rel, '/'));
     // jail: must resolve to the root itself or something beneath "root/".
     if ($real === false ||
         ($real !== $rootReal && strncmp($real, $rootReal . '/', strlen($rootReal) + 1) !== 0)) {
-        return fail('Path not found.');
+        return [false, 'Path not found.'];
     }
+    return [true, $real, $rootReal];
+}
+
+/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
+function browse_snapshot(string $snap, string $rel): array {
+    $r = snapshot_resolve($snap, $rel);
+    if (!$r[0]) return fail($r[1]);
+    [, $real, $rootReal] = $r;
     if (!is_dir($real)) return fail('Not a directory.');
 
     $dirs = []; $files = [];
@@ -633,6 +658,58 @@ switch ($action) {
         http_response_code(400);
         out(['ok' => false, 'message' => "Unknown action: '$action'."]);
 }
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/include/download.php" Mode="0644">
+<INLINE>
+<![CDATA[
+<?php
+/**
+ * download.php — stream a single file from a snapshot's point-in-time tree.
+ *
+ *   GET ?snapshot=<dataset@snap>&path=<rel/path/to/file>
+ *
+ * Read-only and path-jailed via snapshot_resolve() (same guard as browse): the
+ * resolved real path must sit inside <mountpoint>/.zfs/snapshot/<name>/, so
+ * ../ and absolute paths cannot escape. Directories are refused. Behind the
+ * Unraid login like the rest of the plugin; runs as root under php-fpm.
+ */
+
+require_once __DIR__ . '/zfslib.php';
+
+$snap = trim($_GET['snapshot'] ?? '');
+$rel  = (string)($_GET['path'] ?? '');
+
+function deny(int $code, string $msg): void {
+    http_response_code($code);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo $msg;
+    exit;
+}
+
+$r = snapshot_resolve($snap, $rel);
+if (!$r[0])              deny(404, $r[1]);
+$file = $r[1];
+if (is_dir($file))      deny(400, 'Cannot download a directory.');
+if (!is_file($file))    deny(404, 'Not a file.');
+if (!is_readable($file)) deny(403, 'File is not readable.');
+
+$size = @filesize($file);
+
+// Clear any output buffering so the body is exactly the file bytes.
+while (ob_get_level() > 0) ob_end_clean();
+
+header('Content-Type: application/octet-stream');
+header('Content-Disposition: attachment; filename="' . str_replace('"', '', basename($file)) . '"');
+header('X-Content-Type-Options: nosniff');
+if ($size !== false) header('Content-Length: ' . $size);
+
+$fp = fopen($file, 'rb');
+if ($fp === false) deny(500, 'Could not open file.');
+fpassthru($fp);
+fclose($fp);
+exit;
 ]]>
 </INLINE>
 </FILE>

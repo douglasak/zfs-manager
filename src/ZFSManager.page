@@ -81,7 +81,7 @@ $host = emhttp_var('NAME', 'this server');
     </div>
     <div class="zsm-crumbs" id="zsm-br-crumbs"></div>
     <table class="zsm" id="zsm-br-table">
-      <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+      <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th></th></tr></thead>
       <tbody id="zsm-br-body"></tbody>
     </table>
     <p style="opacity:.7;margin:4px 0 0">Read-only point-in-time view from this snapshot.</p>
@@ -91,6 +91,7 @@ $host = emhttp_var('NAME', 'this server');
 <script>
 (function () {
   var API  = '/plugins/zfs.manager/include/api.php';
+  var DL   = '/plugins/zfs.manager/include/download.php';
   var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
 
   function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
@@ -216,35 +217,43 @@ $host = emhttp_var('NAME', 'this server');
 
   function brLoad(path){
     var body = document.getElementById('zsm-br-body');
-    body.innerHTML = '<tr><td colspan="3">Loading…</td></tr>';
+    body.innerHTML = '<tr><td colspan="4">Loading…</td></tr>';
     $.getJSON(API + '?action=browse&snapshot=' + encodeURIComponent(brSnap) + '&path=' + encodeURIComponent(path || ''))
       .done(function(d){
-        if (!d.ok){ body.innerHTML = '<tr><td colspan="3">' + esc(d.message || 'Error') + '</td></tr>'; return; }
+        if (!d.ok){ body.innerHTML = '<tr><td colspan="4">' + esc(d.message || 'Error') + '</td></tr>'; return; }
         document.getElementById('zsm-br-crumbs').innerHTML = crumbs(d.path);
 
         var rows = '';
         if (d.path){
           var parent = d.path.split('/').slice(0, -1).join('/');
           rows += '<tr><td class="tname"><i class="fa fa-level-up"></i> '+
-                  '<a class="dir" data-path="' + esc(parent) + '">..</a></td><td></td><td></td></tr>';
+                  '<a class="dir" data-path="' + esc(parent) + '">..</a></td><td></td><td></td><td></td></tr>';
         }
         if (!d.entries.length && !d.path){
-          rows += '<tr><td colspan="3">(empty)</td></tr>';
+          rows += '<tr><td colspan="4">(empty)</td></tr>';
         }
         d.entries.forEach(function(e){
           var icon = e.type === 'dir' ? 'fa-folder' : (e.type === 'link' ? 'fa-link' : 'fa-file-o');
-          var name = e.type === 'dir'
-            ? '<a class="dir" data-path="' + esc((d.path ? d.path + '/' : '') + e.name) + '">' + esc(e.name) + '</a>'
-            : esc(e.name);
+          var rel  = (d.path ? d.path + '/' : '') + e.name;
+          var name, dl = '';
+          if (e.type === 'dir'){
+            name = '<a class="dir" data-path="' + esc(rel) + '">' + esc(e.name) + '</a>';
+          } else {
+            var href = DL + '?snapshot=' + encodeURIComponent(brSnap) + '&path=' + encodeURIComponent(rel);
+            name = '<a href="' + esc(href) + '" download title="Download">' + esc(e.name) + '</a>';
+            dl   = '<a href="' + esc(href) + '" download title="Download ' + esc(e.name) + '">'+
+                   '<i class="fa fa-download"></i></a>';
+          }
           rows += '<tr>'+
             '<td class="tname"><i class="fa ' + icon + '"></i> ' + name + '</td>'+
             '<td class="num">' + esc(fmtSize(e.size)) + '</td>'+
             '<td>' + esc(fmtTime(e.mtime)) + '</td>'+
+            '<td>' + dl + '</td>'+
           '</tr>';
         });
         body.innerHTML = rows;
       })
-      .fail(function(){ body.innerHTML = '<tr><td colspan="3">Could not reach the ZFS API.</td></tr>'; });
+      .fail(function(){ body.innerHTML = '<tr><td colspan="4">Could not reach the ZFS API.</td></tr>'; });
   }
 
   $(function(){

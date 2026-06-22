@@ -20,10 +20,11 @@ SUPPORT    = f"https://github.com/{GH_USER}/{GH_REPO}/issues"
 
 # (source path relative to SRC, destination path on Unraid, mode)
 FILES = [
-    ("ZFSManager.page", "&plugdir;/ZFSManager.page", "0644"),
-    ("include/zfslib.php",      "&plugdir;/include/zfslib.php",      "0644"),
-    ("include/api.php",         "&plugdir;/include/api.php",         "0644"),
-    ("LICENSE",                 "&plugdir;/LICENSE",                 "0644"),
+    ("ZFSManager.page",      "&plugdir;/ZFSManager.page",      "0644"),
+    ("include/zfslib.php",   "&plugdir;/include/zfslib.php",   "0644"),
+    ("include/api.php",      "&plugdir;/include/api.php",      "0644"),
+    ("include/download.php", "&plugdir;/include/download.php", "0644"),
+    ("LICENSE",              "&plugdir;/LICENSE",              "0644"),
 ]
 
 def cdata(text: str) -> str:
