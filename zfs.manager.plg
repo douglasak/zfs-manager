@@ -2,7 +2,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "zfs.manager">
 <!ENTITY author    "douglasak">
-<!ENTITY version   "2026.06.21">
+<!ENTITY version   "2026.06.21a">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/zfs-manager/main/zfs.manager.plg">
 <!ENTITY support   "https://github.com/douglasak/zfs-manager/issues">
 <!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
@@ -19,10 +19,13 @@
 
 <CHANGES>
 ###&version;
-- Web GUI under Settings -> Utilities -> ZFS Manager: dataset overview table
-  (type, used, avail, refer, block size, compression, ratio, snapshot count),
-  create snapshots (optionally recursive), roll back, and destroy - in
-  auto-refreshing tables.
+- Add read-only snapshot browser: navigate a snapshot's point-in-time file
+  tree (sizes, dates, breadcrumb) via its .zfs/snapshot/ path. Every request is
+  jailed to the snapshot root, so ../ and absolute paths cannot escape.
+
+###previous
+- Web GUI under Settings -> Utilities -> ZFS Manager: dataset overview table,
+  create snapshots (optionally recursive), roll back, and destroy.
 - All zfs calls run on the host with escaped args; every dataset/snapshot is
   validated against the live `zfs list` before use. Mutations require a valid
   Unraid CSRF token.
@@ -67,6 +70,14 @@ $host = emhttp_var('NAME', 'this server');
   #zsm-msg             { margin: 10px 0; min-height: 1.2em; }
   #zsm-msg.ok          { color: #1fa31f; }
   #zsm-msg.err         { color: #c0392b; }
+  #zsm-browser         { border: 1px solid rgba(128,128,128,.35); border-radius: 4px; padding: 10px 14px; margin-bottom: 26px; }
+  .zsm-br-head         { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .zsm-br-head h3      { margin: 0; }
+  .zsm-crumbs          { margin: 4px 0 10px; font-family: monospace; }
+  .zsm-crumbs a        { cursor: pointer; }
+  .zsm-crumbs .sep     { opacity: .5; margin: 0 4px; }
+  table.zsm a.dir      { cursor: pointer; font-weight: bold; }
+  table.zsm .tname i   { width: 1.1em; text-align: center; opacity: .8; }
 </style>
 
 <div class="zsm-wrap">
@@ -106,6 +117,19 @@ $host = emhttp_var('NAME', 'this server');
     </thead>
     <tbody id="zsm-snap-body"><tr><td colspan="6">Loading…</td></tr></tbody>
   </table>
+
+  <div id="zsm-browser" style="display:none">
+    <div class="zsm-br-head">
+      <h3><i class="fa fa-folder-open"></i> Browsing <code id="zsm-br-snap"></code></h3>
+      <button type="button" onclick="zsmBrowseClose()"><i class="fa fa-times"></i> Close</button>
+    </div>
+    <div class="zsm-crumbs" id="zsm-br-crumbs"></div>
+    <table class="zsm" id="zsm-br-table">
+      <thead><tr><th>Name</th><th>Size</th><th>Modified</th></tr></thead>
+      <tbody id="zsm-br-body"></tbody>
+    </table>
+    <p style="opacity:.7;margin:4px 0 0">Read-only point-in-time view from this snapshot.</p>
+  </div>
 </div>
 
 <script>
@@ -153,6 +177,8 @@ $host = emhttp_var('NAME', 'this server');
             '<td class="num">'+esc(s.refer)+'</td>'+
             '<td>'+esc(s.creation)+'</td>'+
             '<td>'+
+              '<button type="button" data-action="browse" data-snap="'+esc(s.name)+'">'+
+                '<i class="fa fa-folder-open"></i> Browse</button> '+
               '<button type="button" class="warn" data-action="rollback" data-snap="'+esc(s.name)+'" '+
                 'data-confirm="Roll back to '+esc(s.name)+'?\n\nThis DISCARDS all changes since this snapshot and DESTROYS any newer snapshots of '+esc(s.dataset)+'.">'+
                 '<i class="fa fa-undo"></i> Rollback</button> '+
@@ -196,6 +222,75 @@ $host = emhttp_var('NAME', 'this server');
     });
   }
 
+  // --- snapshot browser (read-only) ------------------------------------------
+  var brSnap = null;   // current snapshot being browsed
+
+  function fmtSize(n){
+    if (n === null || n === undefined) return '';
+    var u = ['B','K','M','G','T','P'], i = 0;
+    while (n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+    return (i === 0 ? n : (n < 10 ? n.toFixed(1) : Math.round(n))) + u[i];
+  }
+  function fmtTime(epoch){
+    if (!epoch) return '';
+    var d = new Date(epoch * 1000);
+    return d.toLocaleString();
+  }
+  function crumbs(path){
+    var html = '<a data-path="">' + esc(brSnap) + '</a>';
+    var acc = [];
+    (path ? path.split('/') : []).forEach(function(seg){
+      acc.push(seg);
+      html += '<span class="sep">/</span><a data-path="' + esc(acc.join('/')) + '">' + esc(seg) + '</a>';
+    });
+    return html;
+  }
+
+  window.zsmBrowse = function(snap){
+    brSnap = snap;
+    document.getElementById('zsm-br-snap').textContent = snap;
+    document.getElementById('zsm-browser').style.display = '';
+    brLoad('');
+    document.getElementById('zsm-browser').scrollIntoView({ behavior:'smooth', block:'nearest' });
+  };
+  window.zsmBrowseClose = function(){
+    brSnap = null;
+    document.getElementById('zsm-browser').style.display = 'none';
+  };
+
+  function brLoad(path){
+    var body = document.getElementById('zsm-br-body');
+    body.innerHTML = '<tr><td colspan="3">Loading…</td></tr>';
+    $.getJSON(API + '?action=browse&snapshot=' + encodeURIComponent(brSnap) + '&path=' + encodeURIComponent(path || ''))
+      .done(function(d){
+        if (!d.ok){ body.innerHTML = '<tr><td colspan="3">' + esc(d.message || 'Error') + '</td></tr>'; return; }
+        document.getElementById('zsm-br-crumbs').innerHTML = crumbs(d.path);
+
+        var rows = '';
+        if (d.path){
+          var parent = d.path.split('/').slice(0, -1).join('/');
+          rows += '<tr><td class="tname"><i class="fa fa-level-up"></i> '+
+                  '<a class="dir" data-path="' + esc(parent) + '">..</a></td><td></td><td></td></tr>';
+        }
+        if (!d.entries.length && !d.path){
+          rows += '<tr><td colspan="3">(empty)</td></tr>';
+        }
+        d.entries.forEach(function(e){
+          var icon = e.type === 'dir' ? 'fa-folder' : (e.type === 'link' ? 'fa-link' : 'fa-file-o');
+          var name = e.type === 'dir'
+            ? '<a class="dir" data-path="' + esc((d.path ? d.path + '/' : '') + e.name) + '">' + esc(e.name) + '</a>'
+            : esc(e.name);
+          rows += '<tr>'+
+            '<td class="tname"><i class="fa ' + icon + '"></i> ' + name + '</td>'+
+            '<td class="num">' + esc(fmtSize(e.size)) + '</td>'+
+            '<td>' + esc(fmtTime(e.mtime)) + '</td>'+
+          '</tr>';
+        });
+        body.innerHTML = rows;
+      })
+      .fail(function(){ body.innerHTML = '<tr><td colspan="3">Could not reach the ZFS API.</td></tr>'; });
+  }
+
   $(function(){
     $('#zsm-datasets, #zsm-snapshots').on('click', 'button[data-action]', function(){
       var b = this, action = b.dataset.action;
@@ -204,9 +299,17 @@ $host = emhttp_var('NAME', 'this server');
       if (action === 'create'){
         var rec = document.getElementById('zsm-recursive').checked ? '1' : '0';
         doAction(b, { action:'create', dataset:b.dataset.ds, recursive:rec });
+      } else if (action === 'browse'){
+        zsmBrowse(b.dataset.snap);
       } else {
         doAction(b, { action:action, snapshot:b.dataset.snap });
       }
+    });
+
+    // browser navigation (directories + breadcrumb)
+    $('#zsm-br-body, #zsm-br-crumbs').on('click', 'a[data-path]', function(e){
+      e.preventDefault();
+      brLoad(this.getAttribute('data-path'));
     });
 
     zsmLoad();
@@ -373,6 +476,66 @@ function snapshot_rows(): array {
 function ok(string $msg, array $extra = []): array  { return ['ok' => true,  'message' => $msg] + $extra; }
 function fail(string $msg, array $extra = []): array { return ['ok' => false, 'message' => $msg] + $extra; }
 
+// --- read-only snapshot browser ---------------------------------------------
+// A snapshot's point-in-time tree is exposed read-only by ZFS at
+// <dataset-mountpoint>/.zfs/snapshot/<name>/. We list directories within that
+// root and jail every request to it (realpath prefix check), so a crafted
+// ../.. path can never escape the snapshot.
+
+function ds_mountpoint(string $ds): string {
+    [$rc, $out] = zfs(['get', '-H', '-o', 'value', 'mountpoint', $ds]);
+    if ($rc !== 0) return '';
+    $mp = trim(implode('', $out));
+    return ($mp !== '' && $mp[0] === '/') ? $mp : '';   // skip legacy/none/-
+}
+
+/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
+function browse_snapshot(string $snap, string $rel): array {
+    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+    [$ds, $name] = explode('@', $snap, 2);
+
+    $mp = ds_mountpoint($ds);
+    if ($mp === '') return fail("Dataset '$ds' has no browsable mountpoint.");
+
+    $rootReal = realpath($mp . '/.zfs/snapshot/' . $name);   // automounts on access
+    if ($rootReal === false) return fail('Snapshot tree not accessible.');
+
+    $real = realpath($rootReal . '/' . ltrim($rel, '/'));
+    // jail: must resolve to the root itself or something beneath "root/".
+    if ($real === false ||
+        ($real !== $rootReal && strncmp($real, $rootReal . '/', strlen($rootReal) + 1) !== 0)) {
+        return fail('Path not found.');
+    }
+    if (!is_dir($real)) return fail('Not a directory.');
+
+    $dirs = []; $files = [];
+    $dh = @opendir($real);
+    if ($dh === false) return fail('Cannot read directory.');
+    while (($e = readdir($dh)) !== false) {
+        if ($e === '.' || $e === '..') continue;
+        $full   = $real . '/' . $e;
+        $isLink = is_link($full);
+        $isDir  = is_dir($full);
+        $st     = @lstat($full);
+        $entry  = [
+            'name'  => $e,
+            'type'  => $isLink ? 'link' : ($isDir ? 'dir' : 'file'),
+            'size'  => ($isDir || $st === false) ? null : (int)$st['size'],
+            'mtime' => $st !== false ? (int)$st['mtime'] : 0,
+        ];
+        if ($isDir && !$isLink) $dirs[] = $entry; else $files[] = $entry;
+    }
+    closedir($dh);
+    $cmp = fn($a, $b) => strcasecmp($a['name'], $b['name']);
+    usort($dirs, $cmp); usort($files, $cmp);
+
+    return ok('', [
+        'snapshot' => $snap,
+        'path'     => ltrim(substr($real, strlen($rootReal)), '/'),   // '' = root
+        'entries'  => array_merge($dirs, $files),
+    ]);
+}
+
 function act_create(string $ds, bool $recursive): array {
     if (!ds_valid($ds)) return fail("Unknown dataset: '$ds'.");
     $snap = $ds . '@' . date(SNAP_DATE);
@@ -407,6 +570,8 @@ function act_rollback(string $snap): array {
  * Read-only (no CSRF):
  *   GET ?action=list    -> { datasets:[...], snapshots:[...] }
  *   GET ?action=token   -> { token }            (live CSRF token)
+ *   GET ?action=browse  snapshot=<dataset@snap> [path=<rel>]
+ *                       -> { snapshot, path, entries:[{name,type,size,mtime}] }
  *
  * Mutating (require valid CSRF token; names validated against the live zfs list):
  *   create    dataset=<name> [recursive=1]
@@ -442,6 +607,11 @@ if ($action === 'list') {
 // same-origin + Unraid login gate it).
 if ($action === 'token') {
     out(['ok' => true, 'token' => csrf_token()]);
+}
+
+// Read-only directory listing inside a snapshot's point-in-time tree.
+if ($action === 'browse') {
+    out(browse_snapshot(trim($_REQUEST['snapshot'] ?? ''), (string)($_REQUEST['path'] ?? '')));
 }
 
 // --- everything below mutates state -----------------------------------------

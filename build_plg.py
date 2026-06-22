@@ -8,7 +8,10 @@ SRC  = os.path.join(HERE, "src")
 OUT  = os.path.join(HERE, "zfs.manager.plg")
 
 AUTH    = "douglasak"
-VER     = date.today().strftime("%Y.%m.%d")   # CalVer; bump on each release
+# CalVer. Append a letter suffix (a, b, c…) for a second+ release on the same
+# day so Unraid sees it as a newer version than the previous build.
+SUFFIX  = "a"
+VER     = date.today().strftime("%Y.%m.%d") + SUFFIX
 GH_USER = "douglasak"
 GH_REPO = "zfs-manager"
 BRANCH  = "main"   # change to "master" if your repo's default branch is master

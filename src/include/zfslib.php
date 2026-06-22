@@ -151,6 +151,66 @@ function snapshot_rows(): array {
 function ok(string $msg, array $extra = []): array  { return ['ok' => true,  'message' => $msg] + $extra; }
 function fail(string $msg, array $extra = []): array { return ['ok' => false, 'message' => $msg] + $extra; }
 
+// --- read-only snapshot browser ---------------------------------------------
+// A snapshot's point-in-time tree is exposed read-only by ZFS at
+// <dataset-mountpoint>/.zfs/snapshot/<name>/. We list directories within that
+// root and jail every request to it (realpath prefix check), so a crafted
+// ../.. path can never escape the snapshot.
+
+function ds_mountpoint(string $ds): string {
+    [$rc, $out] = zfs(['get', '-H', '-o', 'value', 'mountpoint', $ds]);
+    if ($rc !== 0) return '';
+    $mp = trim(implode('', $out));
+    return ($mp !== '' && $mp[0] === '/') ? $mp : '';   // skip legacy/none/-
+}
+
+/** List a directory inside a snapshot. $rel is relative to the snapshot root. */
+function browse_snapshot(string $snap, string $rel): array {
+    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+    [$ds, $name] = explode('@', $snap, 2);
+
+    $mp = ds_mountpoint($ds);
+    if ($mp === '') return fail("Dataset '$ds' has no browsable mountpoint.");
+
+    $rootReal = realpath($mp . '/.zfs/snapshot/' . $name);   // automounts on access
+    if ($rootReal === false) return fail('Snapshot tree not accessible.');
+
+    $real = realpath($rootReal . '/' . ltrim($rel, '/'));
+    // jail: must resolve to the root itself or something beneath "root/".
+    if ($real === false ||
+        ($real !== $rootReal && strncmp($real, $rootReal . '/', strlen($rootReal) + 1) !== 0)) {
+        return fail('Path not found.');
+    }
+    if (!is_dir($real)) return fail('Not a directory.');
+
+    $dirs = []; $files = [];
+    $dh = @opendir($real);
+    if ($dh === false) return fail('Cannot read directory.');
+    while (($e = readdir($dh)) !== false) {
+        if ($e === '.' || $e === '..') continue;
+        $full   = $real . '/' . $e;
+        $isLink = is_link($full);
+        $isDir  = is_dir($full);
+        $st     = @lstat($full);
+        $entry  = [
+            'name'  => $e,
+            'type'  => $isLink ? 'link' : ($isDir ? 'dir' : 'file'),
+            'size'  => ($isDir || $st === false) ? null : (int)$st['size'],
+            'mtime' => $st !== false ? (int)$st['mtime'] : 0,
+        ];
+        if ($isDir && !$isLink) $dirs[] = $entry; else $files[] = $entry;
+    }
+    closedir($dh);
+    $cmp = fn($a, $b) => strcasecmp($a['name'], $b['name']);
+    usort($dirs, $cmp); usort($files, $cmp);
+
+    return ok('', [
+        'snapshot' => $snap,
+        'path'     => ltrim(substr($real, strlen($rootReal)), '/'),   // '' = root
+        'entries'  => array_merge($dirs, $files),
+    ]);
+}
+
 function act_create(string $ds, bool $recursive): array {
     if (!ds_valid($ds)) return fail("Unknown dataset: '$ds'.");
     $snap = $ds . '@' . date(SNAP_DATE);

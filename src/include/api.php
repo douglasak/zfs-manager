@@ -5,6 +5,8 @@
  * Read-only (no CSRF):
  *   GET ?action=list    -> { datasets:[...], snapshots:[...] }
  *   GET ?action=token   -> { token }            (live CSRF token)
+ *   GET ?action=browse  snapshot=<dataset@snap> [path=<rel>]
+ *                       -> { snapshot, path, entries:[{name,type,size,mtime}] }
  *
  * Mutating (require valid CSRF token; names validated against the live zfs list):
  *   create    dataset=<name> [recursive=1]
@@ -40,6 +42,11 @@ if ($action === 'list') {
 // same-origin + Unraid login gate it).
 if ($action === 'token') {
     out(['ok' => true, 'token' => csrf_token()]);
+}
+
+// Read-only directory listing inside a snapshot's point-in-time tree.
+if ($action === 'browse') {
+    out(browse_snapshot(trim($_REQUEST['snapshot'] ?? ''), (string)($_REQUEST['path'] ?? '')));
 }
 
 // --- everything below mutates state -----------------------------------------
