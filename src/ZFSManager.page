@@ -1,0 +1,176 @@
+Menu="Tools"
+Title="ZFS Manager"
+Icon="camera"
+Type="menu"
+---
+<?php
+/* ZFSManager.page — ZFS snapshot management GUI. */
+require_once '/usr/local/emhttp/plugins/zfs.manager/include/zfslib.php';
+$csrf = csrf_token();
+$host = emhttp_var('NAME', 'this server');
+?>
+
+<style>
+  .zsm-wrap            { max-width: 1100px; }
+  .zsm-warn            { margin: 6px 0 14px; padding: 8px 12px; border: 1px solid rgba(217,164,0,.5);
+                         background: rgba(217,164,0,.08); border-radius: 4px; }
+  .zsm-bar             { margin: 10px 0; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  table.zsm            { width: 100%; border-collapse: collapse; margin-bottom: 26px; }
+  table.zsm th,
+  table.zsm td         { padding: 6px 9px; text-align: left; vertical-align: middle; white-space: nowrap; }
+  table.zsm th         { border-bottom: 1px solid rgba(128,128,128,.35); font-weight: bold; }
+  table.zsm tr + tr td { border-top: 1px solid rgba(128,128,128,.15); }
+  table.zsm td.num     { text-align: right; font-variant-numeric: tabular-nums; }
+  .zsm button          { margin: 0 2px; padding: 3px 8px; cursor: pointer; }
+  .zsm button.danger   { color: #fff; background: #c0392b; }
+  .zsm button.warn     { color: #fff; background: #d9a400; }
+  #zsm-msg             { margin: 10px 0; min-height: 1.2em; }
+  #zsm-msg.ok          { color: #1fa31f; }
+  #zsm-msg.err         { color: #c0392b; }
+</style>
+
+<div class="zsm-wrap">
+  <p>Manage ZFS snapshots on <b><?=htmlspecialchars($host)?></b> — view datasets, create snapshots, roll back, and destroy. The tables auto-refresh every 15&nbsp;seconds.</p>
+
+  <div class="zsm-warn">
+    <b>Rollback</b> discards every change made since the chosen snapshot <i>and destroys any newer
+    snapshots</i> of that dataset (<code>zfs rollback -r</code>). <b>Destroy</b> permanently deletes a
+    snapshot. Both take effect immediately and can lead to data loss. <b>Use entirely at your own
+    risk.</b> No warranty; see LICENSE.
+  </div>
+
+  <div id="zsm-msg"></div>
+
+  <div class="zsm-bar">
+    <label><input type="checkbox" id="zsm-recursive"> Recursive (include child datasets) when creating</label>
+    <button type="button" onclick="zsmLoad()"><i class="fa fa-refresh"></i> Refresh</button>
+  </div>
+
+  <h3><i class="fa fa-database"></i> Datasets</h3>
+  <table class="zsm" id="zsm-datasets">
+    <thead>
+      <tr>
+        <th>Dataset</th><th>Type</th><th>Used</th><th>Avail</th><th>Refer</th>
+        <th>Block</th><th>Compress</th><th>Ratio</th><th>Snaps</th><th>Action</th>
+      </tr>
+    </thead>
+    <tbody id="zsm-ds-body"><tr><td colspan="10">Loading…</td></tr></tbody>
+  </table>
+
+  <h3><i class="fa fa-camera"></i> Snapshots</h3>
+  <table class="zsm" id="zsm-snapshots">
+    <thead>
+      <tr>
+        <th>Dataset</th><th>Snapshot</th><th>Used</th><th>Refer</th><th>Created</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="zsm-snap-body"><tr><td colspan="6">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  var API  = '/plugins/zfs.manager/include/api.php';
+  var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
+
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function msg(text, kind){
+    var el = document.getElementById('zsm-msg');
+    el.className = kind || '';
+    el.textContent = text || '';
+  }
+
+  // --- load (read-only, no CSRF) ---------------------------------------------
+  window.zsmLoad = function(){
+    $.getJSON(API + '?action=list')
+      .done(function(d){
+        if (!d.ok){ msg(d.message || 'Failed to load.', 'err'); return; }
+
+        var ds = d.datasets.length ? d.datasets.map(function(x){
+          return '<tr>'+
+            '<td><b>'+esc(x.name)+'</b></td>'+
+            '<td>'+esc(x.type)+'</td>'+
+            '<td class="num">'+esc(x.used)+'</td>'+
+            '<td class="num">'+esc(x.avail)+'</td>'+
+            '<td class="num">'+esc(x.refer)+'</td>'+
+            '<td class="num">'+esc(x.block)+'</td>'+
+            '<td>'+esc(x.compression)+'</td>'+
+            '<td class="num">'+esc(x.ratio)+'</td>'+
+            '<td class="num">'+esc(x.snaps)+'</td>'+
+            '<td><button type="button" data-action="create" data-ds="'+esc(x.name)+'">'+
+              '<i class="fa fa-camera"></i> Snapshot</button></td>'+
+          '</tr>';
+        }).join('') : '<tr><td colspan="10">No datasets found.</td></tr>';
+        document.getElementById('zsm-ds-body').innerHTML = ds;
+
+        var sn = d.snapshots.length ? d.snapshots.map(function(s){
+          return '<tr>'+
+            '<td>'+esc(s.dataset)+'</td>'+
+            '<td><b>'+esc(s.snap)+'</b></td>'+
+            '<td class="num">'+esc(s.used)+'</td>'+
+            '<td class="num">'+esc(s.refer)+'</td>'+
+            '<td>'+esc(s.creation)+'</td>'+
+            '<td>'+
+              '<button type="button" class="warn" data-action="rollback" data-snap="'+esc(s.name)+'" '+
+                'data-confirm="Roll back to '+esc(s.name)+'?\n\nThis DISCARDS all changes since this snapshot and DESTROYS any newer snapshots of '+esc(s.dataset)+'.">'+
+                '<i class="fa fa-undo"></i> Rollback</button> '+
+              '<button type="button" class="danger" data-action="destroy" data-snap="'+esc(s.name)+'" '+
+                'data-confirm="Permanently destroy '+esc(s.name)+'?">'+
+                '<i class="fa fa-trash"></i> Destroy</button>'+
+            '</td>'+
+          '</tr>';
+        }).join('') : '<tr><td colspan="6">No snapshots.</td></tr>';
+        document.getElementById('zsm-snap-body').innerHTML = sn;
+      })
+      .fail(function(){ msg('Could not reach the ZFS API.', 'err'); });
+  };
+
+  function tokenNow(){
+    if (typeof csrf_token !== 'undefined' && csrf_token) return csrf_token;
+    var el = document.querySelector('input[name="csrf_token"]');
+    if (el && el.value) return el.value;
+    try { if (window.top && window.top.csrf_token) return window.top.csrf_token; } catch(e){}
+    return CSRF || '';
+  }
+
+  // Fetch a fresh token, then issue the mutating request (jQuery GET — the path
+  // this server's proxy honours). cb gets the parsed JSON.
+  function apiCall(params, cb){
+    $.getJSON(API + '?action=token')
+      .done(function(t){
+        var token = (t && t.token) ? t.token : tokenNow();
+        $.ajax({ url: API, type: 'GET', data: $.extend({ csrf_token: token }, params), dataType: 'json', cache: false })
+          .done(function(r){ cb(r || { ok:false, message:'Empty response.' }); })
+          .fail(function(x){ cb({ ok:false, message:(x.responseJSON && x.responseJSON.message) || ('Action failed (HTTP ' + x.status + ').') }); });
+      })
+      .fail(function(x){ cb({ ok:false, message:'Token fetch failed (HTTP ' + x.status + ').' }); });
+  }
+
+  function doAction(btn, params){
+    btn.disabled = true;
+    apiCall(params, function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      setTimeout(zsmLoad, 600);
+    });
+  }
+
+  $(function(){
+    $('#zsm-datasets, #zsm-snapshots').on('click', 'button[data-action]', function(){
+      var b = this, action = b.dataset.action;
+      var c = b.dataset.confirm;
+      if (c && !confirm(c)) return;
+      if (action === 'create'){
+        var rec = document.getElementById('zsm-recursive').checked ? '1' : '0';
+        doAction(b, { action:'create', dataset:b.dataset.ds, recursive:rec });
+      } else {
+        doAction(b, { action:action, snapshot:b.dataset.snap });
+      }
+    });
+
+    zsmLoad();
+    setInterval(zsmLoad, 15000);
+  });
+})();
+</script>

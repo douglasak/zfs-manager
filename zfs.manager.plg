@@ -1,0 +1,517 @@
+<?xml version='1.0' standalone='yes'?>
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "zfs.manager">
+<!ENTITY author    "douglasak">
+<!ENTITY version   "2026.06.21">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/douglasak/zfs-manager/main/zfs.manager.plg">
+<!ENTITY support   "https://github.com/douglasak/zfs-manager/issues">
+<!ENTITY plugdir   "/usr/local/emhttp/plugins/&name;">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        pluginURL="&pluginURL;"
+        support="&support;"
+        launch="Tools/ZFSManager"
+        icon="camera"
+        min="6.12.0">
+
+<CHANGES>
+###&version;
+- Web GUI under Tools -> ZFS Manager: dataset overview table
+  (type, used, avail, refer, block size, compression, ratio, snapshot count),
+  create snapshots (optionally recursive), roll back, and destroy - in
+  auto-refreshing tables.
+- All zfs calls run on the host with escaped args; every dataset/snapshot is
+  validated against the live `zfs list` before use. Mutations require a valid
+  Unraid CSRF token.
+- MIT licensed. Provided AS IS, without warranty; use at your own risk.
+</CHANGES>
+
+<!-- clean any prior install, recreate the tree (runs at install AND every boot) -->
+<FILE Run="/bin/bash">
+<INLINE>
+rm -rf &plugdir;
+mkdir -p &plugdir;/include
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/ZFSManager.page" Mode="0644">
+<INLINE>
+<![CDATA[
+Menu="Tools"
+Title="ZFS Manager"
+Icon="camera"
+Type="menu"
+---
+<?php
+/* ZFSManager.page — ZFS snapshot management GUI. */
+require_once '/usr/local/emhttp/plugins/zfs.manager/include/zfslib.php';
+$csrf = csrf_token();
+$host = emhttp_var('NAME', 'this server');
+?>
+
+<style>
+  .zsm-wrap            { max-width: 1100px; }
+  .zsm-warn            { margin: 6px 0 14px; padding: 8px 12px; border: 1px solid rgba(217,164,0,.5);
+                         background: rgba(217,164,0,.08); border-radius: 4px; }
+  .zsm-bar             { margin: 10px 0; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  table.zsm            { width: 100%; border-collapse: collapse; margin-bottom: 26px; }
+  table.zsm th,
+  table.zsm td         { padding: 6px 9px; text-align: left; vertical-align: middle; white-space: nowrap; }
+  table.zsm th         { border-bottom: 1px solid rgba(128,128,128,.35); font-weight: bold; }
+  table.zsm tr + tr td { border-top: 1px solid rgba(128,128,128,.15); }
+  table.zsm td.num     { text-align: right; font-variant-numeric: tabular-nums; }
+  .zsm button          { margin: 0 2px; padding: 3px 8px; cursor: pointer; }
+  .zsm button.danger   { color: #fff; background: #c0392b; }
+  .zsm button.warn     { color: #fff; background: #d9a400; }
+  #zsm-msg             { margin: 10px 0; min-height: 1.2em; }
+  #zsm-msg.ok          { color: #1fa31f; }
+  #zsm-msg.err         { color: #c0392b; }
+</style>
+
+<div class="zsm-wrap">
+  <p>Manage ZFS snapshots on <b><?=htmlspecialchars($host)?></b> — view datasets, create snapshots, roll back, and destroy. The tables auto-refresh every 15&nbsp;seconds.</p>
+
+  <div class="zsm-warn">
+    <b>Rollback</b> discards every change made since the chosen snapshot <i>and destroys any newer
+    snapshots</i> of that dataset (<code>zfs rollback -r</code>). <b>Destroy</b> permanently deletes a
+    snapshot. Both take effect immediately and can lead to data loss. <b>Use entirely at your own
+    risk.</b> No warranty; see LICENSE.
+  </div>
+
+  <div id="zsm-msg"></div>
+
+  <div class="zsm-bar">
+    <label><input type="checkbox" id="zsm-recursive"> Recursive (include child datasets) when creating</label>
+    <button type="button" onclick="zsmLoad()"><i class="fa fa-refresh"></i> Refresh</button>
+  </div>
+
+  <h3><i class="fa fa-database"></i> Datasets</h3>
+  <table class="zsm" id="zsm-datasets">
+    <thead>
+      <tr>
+        <th>Dataset</th><th>Type</th><th>Used</th><th>Avail</th><th>Refer</th>
+        <th>Block</th><th>Compress</th><th>Ratio</th><th>Snaps</th><th>Action</th>
+      </tr>
+    </thead>
+    <tbody id="zsm-ds-body"><tr><td colspan="10">Loading…</td></tr></tbody>
+  </table>
+
+  <h3><i class="fa fa-camera"></i> Snapshots</h3>
+  <table class="zsm" id="zsm-snapshots">
+    <thead>
+      <tr>
+        <th>Dataset</th><th>Snapshot</th><th>Used</th><th>Refer</th><th>Created</th><th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="zsm-snap-body"><tr><td colspan="6">Loading…</td></tr></tbody>
+  </table>
+</div>
+
+<script>
+(function () {
+  var API  = '/plugins/zfs.manager/include/api.php';
+  var CSRF = '<?=$csrf?>' || (typeof csrf_token !== 'undefined' && csrf_token ? csrf_token : '');
+
+  function esc(s){ return String(s).replace(/[&<>"']/g, function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function msg(text, kind){
+    var el = document.getElementById('zsm-msg');
+    el.className = kind || '';
+    el.textContent = text || '';
+  }
+
+  // --- load (read-only, no CSRF) ---------------------------------------------
+  window.zsmLoad = function(){
+    $.getJSON(API + '?action=list')
+      .done(function(d){
+        if (!d.ok){ msg(d.message || 'Failed to load.', 'err'); return; }
+
+        var ds = d.datasets.length ? d.datasets.map(function(x){
+          return '<tr>'+
+            '<td><b>'+esc(x.name)+'</b></td>'+
+            '<td>'+esc(x.type)+'</td>'+
+            '<td class="num">'+esc(x.used)+'</td>'+
+            '<td class="num">'+esc(x.avail)+'</td>'+
+            '<td class="num">'+esc(x.refer)+'</td>'+
+            '<td class="num">'+esc(x.block)+'</td>'+
+            '<td>'+esc(x.compression)+'</td>'+
+            '<td class="num">'+esc(x.ratio)+'</td>'+
+            '<td class="num">'+esc(x.snaps)+'</td>'+
+            '<td><button type="button" data-action="create" data-ds="'+esc(x.name)+'">'+
+              '<i class="fa fa-camera"></i> Snapshot</button></td>'+
+          '</tr>';
+        }).join('') : '<tr><td colspan="10">No datasets found.</td></tr>';
+        document.getElementById('zsm-ds-body').innerHTML = ds;
+
+        var sn = d.snapshots.length ? d.snapshots.map(function(s){
+          return '<tr>'+
+            '<td>'+esc(s.dataset)+'</td>'+
+            '<td><b>'+esc(s.snap)+'</b></td>'+
+            '<td class="num">'+esc(s.used)+'</td>'+
+            '<td class="num">'+esc(s.refer)+'</td>'+
+            '<td>'+esc(s.creation)+'</td>'+
+            '<td>'+
+              '<button type="button" class="warn" data-action="rollback" data-snap="'+esc(s.name)+'" '+
+                'data-confirm="Roll back to '+esc(s.name)+'?\n\nThis DISCARDS all changes since this snapshot and DESTROYS any newer snapshots of '+esc(s.dataset)+'.">'+
+                '<i class="fa fa-undo"></i> Rollback</button> '+
+              '<button type="button" class="danger" data-action="destroy" data-snap="'+esc(s.name)+'" '+
+                'data-confirm="Permanently destroy '+esc(s.name)+'?">'+
+                '<i class="fa fa-trash"></i> Destroy</button>'+
+            '</td>'+
+          '</tr>';
+        }).join('') : '<tr><td colspan="6">No snapshots.</td></tr>';
+        document.getElementById('zsm-snap-body').innerHTML = sn;
+      })
+      .fail(function(){ msg('Could not reach the ZFS API.', 'err'); });
+  };
+
+  function tokenNow(){
+    if (typeof csrf_token !== 'undefined' && csrf_token) return csrf_token;
+    var el = document.querySelector('input[name="csrf_token"]');
+    if (el && el.value) return el.value;
+    try { if (window.top && window.top.csrf_token) return window.top.csrf_token; } catch(e){}
+    return CSRF || '';
+  }
+
+  // Fetch a fresh token, then issue the mutating request (jQuery GET — the path
+  // this server's proxy honours). cb gets the parsed JSON.
+  function apiCall(params, cb){
+    $.getJSON(API + '?action=token')
+      .done(function(t){
+        var token = (t && t.token) ? t.token : tokenNow();
+        $.ajax({ url: API, type: 'GET', data: $.extend({ csrf_token: token }, params), dataType: 'json', cache: false })
+          .done(function(r){ cb(r || { ok:false, message:'Empty response.' }); })
+          .fail(function(x){ cb({ ok:false, message:(x.responseJSON && x.responseJSON.message) || ('Action failed (HTTP ' + x.status + ').') }); });
+      })
+      .fail(function(x){ cb({ ok:false, message:'Token fetch failed (HTTP ' + x.status + ').' }); });
+  }
+
+  function doAction(btn, params){
+    btn.disabled = true;
+    apiCall(params, function(r){
+      msg(r.message, r.ok ? 'ok' : 'err');
+      setTimeout(zsmLoad, 600);
+    });
+  }
+
+  $(function(){
+    $('#zsm-datasets, #zsm-snapshots').on('click', 'button[data-action]', function(){
+      var b = this, action = b.dataset.action;
+      var c = b.dataset.confirm;
+      if (c && !confirm(c)) return;
+      if (action === 'create'){
+        var rec = document.getElementById('zsm-recursive').checked ? '1' : '0';
+        doAction(b, { action:'create', dataset:b.dataset.ds, recursive:rec });
+      } else {
+        doAction(b, { action:action, snapshot:b.dataset.snap });
+      }
+    });
+
+    zsmLoad();
+    setInterval(zsmLoad, 15000);
+  });
+})();
+</script>
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/include/zfslib.php" Mode="0644">
+<INLINE>
+<![CDATA[
+<?php
+/**
+ * zfslib.php — core logic for the zfs.manager Unraid plugin.
+ *
+ * Runs on the Unraid host as root under emhttp's php-fpm, so it calls the zfs
+ * CLI directly. Every dataset/snapshot argument is validated against the live
+ * `zfs list` output before use, and shell args are escaped.
+ */
+
+const PLUGIN     = 'zfs.manager';
+const PLUGIN_DIR = '/usr/local/emhttp/plugins/' . PLUGIN;
+const SNAP_DATE  = 'Y-m-d-His';   // matches the @YYYY-MM-DD-HHMMSS pool convention
+
+// --- var.ini / CSRF ---------------------------------------------------------
+
+/**
+ * Read Unraid's var.ini robustly. Under php-fpm, open_basedir may block PHP file
+ * functions from /var/local/emhttp; exec() spawns a process not subject to it.
+ */
+function emhttp_var_raw(): string {
+    $ini = @file_get_contents('/var/local/emhttp/var.ini');
+    if ($ini === false || $ini === '') {
+        $out = [];
+        @exec('cat /var/local/emhttp/var.ini 2>/dev/null', $out);
+        $ini = implode("\n", $out);
+    }
+    return (string)$ini;
+}
+
+/** Pull a single key from var.ini (quote-agnostic), avoiding parse_ini_file. */
+function emhttp_var(string $key, string $default = ''): string {
+    $re = '/^' . preg_quote($key, '/') . '="?([^"\r\n]*)"?/m';
+    if (preg_match($re, emhttp_var_raw(), $m)) return $m[1];
+    return $default;
+}
+
+/** Unraid CSRF token. */
+function csrf_token(): string {
+    return emhttp_var('csrf_token');
+}
+
+// --- zfs binary + runner ----------------------------------------------------
+
+function zfs_bin(): string {
+    static $b = null;
+    if ($b !== null) return $b;
+    foreach (['/usr/sbin/zfs', '/sbin/zfs', '/usr/bin/zfs', '/usr/local/sbin/zfs'] as $c) {
+        if (is_executable($c)) return $b = $c;
+    }
+    return $b = 'zfs';
+}
+
+/** Run zfs with each argument escaped. Returns [rc, output-lines]. */
+function zfs(array $args): array {
+    $cmd = escapeshellarg(zfs_bin());
+    foreach ($args as $a) $cmd .= ' ' . escapeshellarg((string)$a);
+    $out = []; $rc = 0;
+    exec($cmd . ' 2>&1', $out, $rc);
+    return [$rc, $out];
+}
+
+// --- queries / validation ---------------------------------------------------
+
+/** Names of all filesystems and volumes. */
+function ds_names(): array {
+    [$rc, $out] = zfs(['list', '-H', '-o', 'name', '-t', 'filesystem,volume']);
+    if ($rc !== 0) return [];
+    return array_values(array_filter(array_map('trim', $out), fn($n) => $n !== ''));
+}
+
+/** Names of all snapshots. */
+function snap_names(): array {
+    [$rc, $out] = zfs(['list', '-H', '-o', 'name', '-t', 'snapshot']);
+    if ($rc !== 0) return [];
+    return array_values(array_filter(array_map('trim', $out), fn($n) => $n !== ''));
+}
+
+/** Only datasets zfs reports are accepted — guards create. */
+function ds_valid(string $ds): bool {
+    return $ds !== '' && in_array($ds, ds_names(), true);
+}
+
+/** Only snapshots zfs reports are accepted — guards destroy/rollback. */
+function snap_valid(string $s): bool {
+    return strpos($s, '@') !== false && in_array($s, snap_names(), true);
+}
+
+/** Per-dataset snapshot counts, keyed by dataset name. */
+function snap_counts(): array {
+    $counts = [];
+    foreach (snap_names() as $s) {
+        $ds = explode('@', $s, 2)[0];
+        $counts[$ds] = ($counts[$ds] ?? 0) + 1;
+    }
+    return $counts;
+}
+
+/** Dataset detail rows: name,type,used,avail,refer,block,compression,ratio,snaps. */
+function dataset_details(): array {
+    $counts = snap_counts();
+    [$rc, $lines] = zfs(['list', '-H', '-o',
+        'name,type,used,avail,refer,recordsize,volblocksize,compression,compressratio',
+        '-t', 'filesystem,volume']);
+    $rows = [];
+    foreach ($lines as $line) {
+        if ($line === '') continue;
+        $f = explode("\t", $line);
+        if (count($f) < 9) continue;
+        [$name, $type, $used, $avail, $refer, $rec, $volblk, $comp, $ratio] = $f;
+        $block = ($rec !== '-') ? $rec : $volblk;   // recordsize for fs, volblocksize for zvols
+        $rows[] = [
+            'name'        => $name,
+            'type'        => $type,
+            'used'        => $used,
+            'avail'       => $avail,
+            'refer'       => $refer,
+            'block'       => $block,
+            'compression' => $comp,
+            'ratio'       => $ratio,
+            'snaps'       => $counts[$name] ?? 0,
+        ];
+    }
+    return $rows;
+}
+
+/** Snapshot rows, newest first: name,dataset,snap,used,refer,creation. */
+function snapshot_rows(): array {
+    [$rc, $lines] = zfs(['list', '-H', '-s', 'creation', '-o',
+        'name,used,refer,creation', '-t', 'snapshot']);
+    $rows = [];
+    foreach ($lines as $line) {
+        if ($line === '') continue;
+        $f = explode("\t", $line);
+        if (count($f) < 4) continue;
+        [$name, $used, $refer, $creation] = $f;
+        $parts = explode('@', $name, 2);
+        $rows[] = [
+            'name'     => $name,
+            'dataset'  => $parts[0],
+            'snap'     => $parts[1] ?? '',
+            'used'     => $used,
+            'refer'    => $refer,
+            'creation' => $creation,
+        ];
+    }
+    return array_reverse($rows);   // newest first
+}
+
+// --- actions ----------------------------------------------------------------
+
+function ok(string $msg, array $extra = []): array  { return ['ok' => true,  'message' => $msg] + $extra; }
+function fail(string $msg, array $extra = []): array { return ['ok' => false, 'message' => $msg] + $extra; }
+
+function act_create(string $ds, bool $recursive): array {
+    if (!ds_valid($ds)) return fail("Unknown dataset: '$ds'.");
+    $snap = $ds . '@' . date(SNAP_DATE);
+    $args = ['snapshot'];
+    if ($recursive) $args[] = '-r';
+    $args[] = $snap;
+    [$rc, $out] = zfs($args);
+    return $rc === 0 ? ok("Created $snap") : fail(trim(implode("\n", $out)));
+}
+
+function act_destroy(string $snap): array {
+    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+    [$rc, $out] = zfs(['destroy', $snap]);
+    return $rc === 0 ? ok("Destroyed $snap") : fail(trim(implode("\n", $out)));
+}
+
+function act_rollback(string $snap): array {
+    if (!snap_valid($snap)) return fail("Unknown snapshot: '$snap'.");
+    [$rc, $out] = zfs(['rollback', '-r', $snap]);
+    return $rc === 0 ? ok("Rolled back to $snap") : fail(trim(implode("\n", $out)));
+}
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/include/api.php" Mode="0644">
+<INLINE>
+<![CDATA[
+<?php
+/**
+ * api.php — JSON endpoint for the zfs.manager plugin UI.
+ *
+ * Read-only (no CSRF):
+ *   GET ?action=list    -> { datasets:[...], snapshots:[...] }
+ *   GET ?action=token   -> { token }            (live CSRF token)
+ *
+ * Mutating (require valid CSRF token; names validated against the live zfs list):
+ *   create    dataset=<name> [recursive=1]
+ *   destroy   snapshot=<dataset@snap>
+ *   rollback  snapshot=<dataset@snap>
+ *
+ * Runs as root under emhttp's php-fpm.
+ */
+
+require_once __DIR__ . '/zfslib.php';
+
+header('Content-Type: application/json');
+
+function out(array $data): void { echo json_encode($data); exit; }
+
+function require_csrf(): void {
+    $real = csrf_token();
+    $got  = (string)($_REQUEST['csrf_token'] ?? '');
+    if ($real === '' || !hash_equals($real, $got)) {
+        http_response_code(403);
+        out(['ok' => false, 'message' => 'Invalid CSRF token.']);
+    }
+}
+
+$action = $_REQUEST['action'] ?? '';
+
+// --- read-only ---------------------------------------------------------------
+if ($action === 'list') {
+    out(['ok' => true, 'datasets' => dataset_details(), 'snapshots' => snapshot_rows()]);
+}
+
+// Live CSRF token (the page fetches this via jQuery GET right before each action;
+// same-origin + Unraid login gate it).
+if ($action === 'token') {
+    out(['ok' => true, 'token' => csrf_token()]);
+}
+
+// --- everything below mutates state -----------------------------------------
+require_csrf();
+
+switch ($action) {
+    case 'create':
+        $ds  = trim($_REQUEST['dataset'] ?? '');
+        $rec = ($_REQUEST['recursive'] ?? '') === '1';
+        out(act_create($ds, $rec));
+
+    case 'destroy':
+        out(act_destroy(trim($_REQUEST['snapshot'] ?? '')));
+
+    case 'rollback':
+        out(act_rollback(trim($_REQUEST['snapshot'] ?? '')));
+
+    default:
+        http_response_code(400);
+        out(['ok' => false, 'message' => "Unknown action: '$action'."]);
+}
+]]>
+</INLINE>
+</FILE>
+<FILE Name="&plugdir;/LICENSE" Mode="0644">
+<INLINE>
+<![CDATA[
+MIT License
+
+Copyright (c) 2026 Doug Kravitz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+]]>
+</INLINE>
+</FILE>
+<!-- post-install -->
+<FILE Run="/bin/bash">
+<INLINE>
+echo ""
+echo "+=============================================================+"
+echo "| zfs.manager installed.                                      |"
+echo "| Open it at:  Tools -> ZFS Manager                           |"
+echo "+=============================================================+"
+echo ""
+</INLINE>
+</FILE>
+
+<!-- uninstall handler -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+rm -rf &plugdir;
+echo "zfs.manager removed."
+</INLINE>
+</FILE>
+
+</PLUGIN>
