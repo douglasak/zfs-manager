@@ -1,7 +1,6 @@
-Menu="Tools"
+Menu="Utilities"
 Title="ZFS Manager"
 Icon="camera"
-Type="menu"
 ---
 <?php
 /* ZFSManager.page — ZFS snapshot management GUI. */

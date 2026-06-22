@@ -43,13 +43,13 @@ parts.append(f"""<?xml version='1.0' standalone='yes'?>
         version="&version;"
         pluginURL="&pluginURL;"
         support="&support;"
-        launch="Tools/ZFSManager"
+        launch="Settings/ZFSManager"
         icon="camera"
         min="6.12.0">
 
 <CHANGES>
 ###&version;
-- Web GUI under Tools -> ZFS Manager: dataset overview table
+- Web GUI under Settings -> Utilities -> ZFS Manager: dataset overview table
   (type, used, avail, refer, block size, compression, ratio, snapshot count),
   create snapshots (optionally recursive), roll back, and destroy — in
   auto-refreshing tables.
@@ -84,8 +84,8 @@ parts.append("""<!-- post-install -->
 <INLINE>
 echo ""
 echo "+=============================================================+"
-echo "| zfs.manager installed.                             |"
-echo "| Open it at:  Tools -> ZFS Manager                  |"
+echo "| zfs.manager installed.                                      |"
+echo "| Open it at:  Settings -> Utilities -> ZFS Manager           |"
 echo "+=============================================================+"
 echo ""
 </INLINE>

@@ -19,7 +19,7 @@ php-fpm worker run as **root on the same host as ZFS**, so the plugin calls the
 `zfs` CLI directly — no SSH, no agent. The core logic lives in
 `include/zfslib.php` (thin `zfs` wrappers plus action handlers);
 `include/api.php` is a small JSON endpoint the page calls; and
-`ZFSManager.page` is the GUI under **Tools**.
+`ZFSManager.page` is the GUI under **Settings → Utilities**.
 
 Every dataset/snapshot argument is validated against the live `zfs list` output
 before use, shell arguments are escaped, and all mutating actions (create,
@@ -40,7 +40,7 @@ notifies you of updates when a newer version is pushed to the repo.
 **From a local file:** copy `zfs.manager.plg` to the server (e.g. to
 `/boot/config/plugins/`) and install that path instead.
 
-Then open it at **Tools → ZFS Manager**.
+Then open it at **Settings → Utilities → ZFS Manager**.
 
 The `.plg` is self-contained — every file is inlined as CDATA, so there is no
 external download at install time.
@@ -49,7 +49,7 @@ external download at install time.
 
 ```
 src/
-  ZFSManager.page   # GUI (HTML + CSS + JS), Tools menu
+  ZFSManager.page   # GUI (HTML + CSS + JS), Settings -> Utilities
   include/zfslib.php        # zfs wrappers, validation, action handlers
   include/api.php           # JSON endpoint
   LICENSE
